@@ -230,6 +230,50 @@ def cached_candidates(lat, lng, k=8):
     return out
 
 
+def kakao_nearby_chargers_all(lng, lat, radius_m=20000, limit=15):
+    """휴게소 제한 없이 카카오 검색에 잡히는 모든 전기차 충전소."""
+    j = kakao_get("https://dapi.kakao.com/v2/local/search/keyword.json",
+                  {"query": "전기차 충전소", "x": lng, "y": lat, "radius": radius_m,
+                   "sort": "distance", "size": min(limit, 15)})
+    out = []
+    for d in j.get("documents", []):
+        out.append({
+            "name": d["place_name"],
+            "addr": d.get("road_address_name") or d.get("address_name", ""),
+            "lng": float(d["x"]), "lat": float(d["y"]),
+        })
+    return out
+
+
+def match_to_highway_dataset(lat, lng, max_offset_km=0.15):
+    """카카오 결과가 우리 고속도로 인덱스에 있는 곳과 같은 지점이면 statId를 찾아준다
+    (150m 이내 = 사실상 같은 충전소). 찾으면 실시간 상태를 붙일 수 있다."""
+    df = load_highway_chargers()
+    d = haversine_km(lng, lat, df["lng"].values, df["lat"].values)
+    k = int(np.argmin(d))
+    return df.iloc[k]["statId"] if d[k] <= max_offset_km else None
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def cached_candidates_all(lat, lng, k=8):
+    """'현재 고속도로입니다' 체크를 끄면 쓰는 버전 — 고속도로 여부와 관계없이
+    카카오에 잡히는 근처 충전소 전부를 후보로 삼는다."""
+    out = []
+    for c in kakao_nearby_chargers_all(lng, lat, radius_m=20000, limit=k):
+        result = kakao_directions((lng, lat), (c["lng"], c["lat"]))
+        if result is None:
+            continue
+        distance_km, duration_min = result
+        stat_id = match_to_highway_dataset(c["lat"], c["lng"])
+        status = data_go_kr_status(stat_id) if stat_id else {"label": "실시간 정보 없음", "available": None}
+        out.append({
+            "name": c["name"], "addr": c["addr"], "lat": c["lat"], "lng": c["lng"],
+            "driving_km": round(distance_km, 1), "duration_min": round(duration_min, 0),
+            "congestion": status["label"], "available": status["available"],
+        })
+    return out
+
+
 def rank_with_conditions(candidates, cond):
     ranked = []
     for c in candidates:
@@ -239,8 +283,8 @@ def rank_with_conditions(candidates, cond):
         total_kwh = rate * c["driving_km"] / 100
         ranked.append({**c, "predicted_kwh100km": round(rate, 1),
                        "predicted_total_kwh": round(total_kwh, 2)})
-    # 사용 가능한 충전기가 있는 곳을 먼저, 그 안에서는 예측 소모전력이 적은 순.
-    ranked.sort(key=lambda r: (0 if (r["available"] or 0) > 0 else 1, r["predicted_total_kwh"]))
+    # 예측 소모전력(=거리) 기준을 먼저 보고, 같은 값이면 충전 가능한 곳을 앞에 둔다.
+    ranked.sort(key=lambda r: (r["predicted_total_kwh"], 0 if (r["available"] or 0) > 0 else 1))
     return ranked
 
 
@@ -372,12 +416,18 @@ tab_loc, tab_route = st.tabs(["📍 현재 위치 기준 추천", "🗺️ 출�
 
 with tab_loc:
     st.caption(
-        "Streamlit은 서버 사이드 앱이라 브라우저 GPS에 직접 접근하지 못해, 주소/장소명으로 입력받습니다. "
-        "후보는 전국 고속도로 휴게소 충전소(data.go.kr, kind=C0)만 대상으로 하므로 "
-        "나들목 밖 일반 충전소가 섞여 나오지 않습니다."
+        "Streamlit은 서버 사이드 앱이라 브라우저 GPS에 직접 접근하지 못해, 주소/장소명으로 입력받습니다."
     )
     loc_q = st.text_input("현재 위치 (주소 또는 장소명)", placeholder="예: 충북 영동군 추풍령면")
-    go_loc = st.button("근처 휴게소 추천받기", type="primary")
+    highway_mode = st.checkbox(
+        "🛣️ 현재 고속도로입니다 — 휴게소만 검색",
+        value=True,
+        help="켜면 전국 고속도로 휴게소·영업소(data.go.kr kind=C0, 670개)만 찾아서 "
+             "나들목 밖 일반 충전소가 섞이지 않습니다. 끄면 고속도로 여부와 상관없이 "
+             "근처 충전소를 전부 가져옵니다 — 실시간 혼잡도는 고속도로 인덱스와 "
+             "좌표가 겹치는 곳에서만 붙습니다.",
+    )
+    go_loc = st.button("근처 충전소 추천받기", type="primary")
 
     if go_loc:
         if not loc_q:
@@ -392,8 +442,11 @@ with tab_loc:
 
     if "recommend_loc" in st.session_state:
         loc = st.session_state["recommend_loc"]
-        with st.spinner("근처 휴게소 검색 · 실시간 혼잡도 조회 중..."):
-            candidates = cached_candidates(loc["lat"], loc["lng"], k=8)
+        with st.spinner("근처 충전소 검색 · 실시간 혼잡도 조회 중..."):
+            if highway_mode:
+                candidates = cached_candidates(loc["lat"], loc["lng"], k=8)
+            else:
+                candidates = cached_candidates_all(loc["lat"], loc["lng"], k=8)
         ranked = rank_with_conditions(candidates, {
             "mass_kg": mass_kg, "ambient_temp_C": ambient_temp_C,
             "driving_style_index": driving_style_index,
@@ -438,10 +491,14 @@ with tab_loc:
                                "predicted_total_kwh": "예측소모(kWh)",
                                "predicted_kwh100km": "전비(kWh/100km)", "congestion": "실시간 혼잡도"})
             st.dataframe(table, width="stretch", hide_index=True)
+            source_note = (
+                "data.go.kr 전기차 충전소 정보(kind=C0 중 진짜 고속도로 시설만, 전국 670개)에서 직선거리로 "
+                "가장 가까운 8곳을 뽑고" if highway_mode else
+                "카카오 근처 검색으로 고속도로 여부 상관없이 가까운 8곳을 뽑고"
+            )
             st.caption(
-                "후보 목록은 data.go.kr 전기차 충전소 정보(kind=C0 중 진짜 고속도로 시설만, 전국 670개)에서 "
-                "직선거리로 가장 가까운 8곳을 뽑고, 카카오 길찾기로 실제 도로거리를, 각 충전소 ID로 "
-                "실시간 상태를 다시 조회한 것입니다. 순위는 '충전 가능한 곳 우선 → 그 안에서 예측 소모전력 적은 순'입니다."
+                f"후보 목록은 {source_note}, 카카오 길찾기로 실제 도로거리를, 겹치는 곳은 충전소 ID로 "
+                "실시간 상태를 다시 조회한 것입니다. 순위는 '예측 소모전력(거리) 적은 순 → 같으면 충전 가능한 곳 우선'입니다."
             )
 
 with tab_route:
